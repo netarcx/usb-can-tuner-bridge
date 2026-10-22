@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>USB-CAN Tuner Bridge</AssemblyName>
+    <Version>0.1.0</Version>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <DebugType>none</DebugType>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../bridge.py" LogicalName="Payload.bridge.py" />
+    <EmbeddedResource Include="../control.py" LogicalName="Payload.control.py" />
+    <EmbeddedResource Include="../requirements.txt" LogicalName="Payload.requirements.txt" />
+    <EmbeddedResource Include="../requirements-alpha.txt" LogicalName="Payload.requirements-alpha.txt" />
+    <EmbeddedResource Include="setup.ps1" LogicalName="Payload.setup.ps1" />
+    <EmbeddedResource Include="open-tuner.ps1" LogicalName="Payload.open-tuner.ps1" />
+  </ItemGroup>
+</Project>

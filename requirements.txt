@@ -1,0 +1,7 @@
+--only-binary=:all:
+--require-hashes
+phoenix6==26.3.0 \
+    --hash=sha256:0cf6b7ada61780122b74674dac3069a5b277491877b9a1951f738f1aa1c9bc31 \
+    --hash=sha256:9ecba4f6113bb333a7bd0dd5b8367a40e0ed4d1ca7d354f29372d1e5e2ff6557
+importlib_resources==7.1.0 \
+    --hash=sha256:1bd7b48b4088eddb2cd16382150bb515af0bd2c70128194392725f82ad2c96a1
