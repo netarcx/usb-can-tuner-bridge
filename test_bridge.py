@@ -3,6 +3,7 @@
 import subprocess
 import socket
 import ctypes
+import copy
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,87 @@ from unittest.mock import Mock, patch
 
 import bridge
 import control
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.record = {"pid": 123, "token": "token", "interface": "can0", "ifindex": 10,
+                       "serial": "test-adapter", "profile": "stable"}
+        self.info = {"ifname": "can0", "ifindex": 10, "flags": ["UP"], "mtu": 16,
+                     "linkinfo": {"info_kind": "can", "info_data": {
+                         "state": "ERROR-ACTIVE", "bittiming": {"bitrate": 1_000_000}}}}
+
+    def test_http_server_cannot_make_missing_can_interface_ready(self):
+        with patch.object(control, "matching_interfaces", return_value=[]):
+            status = control.inspect_connection(self.record)
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["interfaces"], [])
+
+    def test_transient_netlink_failure_is_disconnected_and_recovers_next_sample(self):
+        with patch.object(control, "matching_interfaces", side_effect=[bridge.BridgeError("interface vanished"), [self.info]]):
+            self.assertFalse(control.inspect_connection(self.record)["ready"])
+            self.assertTrue(control.inspect_connection(self.record)["ready"])
+
+    def test_healthy_existing_bus_is_not_reconfigured(self):
+        with patch.object(control, "is_alive", return_value=True), \
+             patch.object(control, "matching_interfaces", return_value=[self.info]), \
+             patch.object(bridge, "configure_interface") as configure:
+            self.assertEqual(control.recover_connection(self.record, "test-adapter", "stable"), self.record)
+            configure.assert_not_called()
+
+    def test_new_netdev_can_be_configured_without_restarting_phoenix(self):
+        self.info.update(ifindex=11, flags=[])
+        def bring_up(*_args):
+            self.info["flags"] = ["UP"]
+        with patch.object(control, "is_alive", return_value=True), \
+             patch.object(control, "matching_interfaces", return_value=[self.info]), \
+             patch.object(bridge, "configure_interface", side_effect=bring_up) as configure, \
+             patch.object(subprocess, "Popen") as spawn:
+            recovered = control.recover_connection(self.record, "test-adapter", "stable")
+        configure.assert_called_once_with("can0", 1_000_000)
+        spawn.assert_not_called()
+        self.assertEqual(recovered["pid"], self.record["pid"])
+        self.assertEqual(recovered["ifindex"], 11)
+
+    def test_existing_down_netdev_and_unknown_old_index_are_preserved(self):
+        self.info["flags"] = []
+        for previous in [10, None]:
+            with self.subTest(previous=previous), \
+                 patch.object(control, "is_alive", return_value=True), \
+                 patch.object(control, "matching_interfaces", return_value=[self.info]), \
+                 patch.object(bridge, "configure_interface") as configure:
+                record = {**self.record, "ifindex": previous}
+                with self.assertRaises(bridge.BridgeError):
+                    control.recover_connection(record, "test-adapter", "stable")
+                configure.assert_not_called()
+
+    def test_different_adapter_profile_or_backend_is_not_recovered(self):
+        for alive, serial, profile in [(False, "test-adapter", "stable"), (True, "other", "stable"), (True, "test-adapter", "alpha")]:
+            with self.subTest(alive=alive, serial=serial, profile=profile), \
+                 patch.object(control, "is_alive", return_value=alive), \
+                 patch.object(bridge, "configure_interface") as configure:
+                with self.assertRaises(bridge.BridgeError):
+                    control.recover_connection(self.record, serial, profile)
+                configure.assert_not_called()
+
+    def test_bus_off_and_wrong_interface_names_are_not_reset(self):
+        other = copy.deepcopy(self.info)
+        other["ifname"] = "can1"
+        bus_off = copy.deepcopy(self.info)
+        bus_off["linkinfo"]["info_data"]["state"] = "BUS-OFF"
+        for interfaces in [[other], [bus_off], [self.info, other]]:
+            with self.subTest(interfaces=interfaces), \
+                 patch.object(control, "is_alive", return_value=True), \
+                 patch.object(control, "matching_interfaces", return_value=interfaces), \
+                 patch.object(bridge, "configure_interface") as configure:
+                with self.assertRaises(bridge.BridgeError):
+                    control.recover_connection(self.record, "test-adapter", "stable")
+                configure.assert_not_called()
+
+    def test_wrong_bitrate_is_not_reported_as_connected(self):
+        self.info["linkinfo"]["info_data"]["bittiming"]["bitrate"] = 500_000
+        with patch.object(control, "matching_interfaces", return_value=[self.info]):
+            self.assertFalse(control.inspect_connection(self.record)["ready"])
 
 
 class BridgeTests(unittest.TestCase):

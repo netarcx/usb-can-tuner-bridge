@@ -46,9 +46,73 @@ def is_alive(record: dict) -> bool:
         return False
 
 
+def inspect_connection(record: dict) -> dict:
+    try:
+        interfaces = matching_interfaces(record.get("serial", "")) if record.get("serial") else []
+    except (OSError, bridge.BridgeError) as exc:
+        # sysfs and netlink can disappear between reads during unplug. A failed
+        # status sample must not latch the GUI out of later USB reattachment.
+        return {"ready": False, "interfaces": [], "reason": f"CAN interface is changing; retrying inspection: {exc}"}
+    result = {"ready": False, "interfaces": interfaces, "reason": "USB-CAN adapter is not attached to this WSL distribution."}
+    if len(interfaces) != 1:
+        if interfaces:
+            result["reason"] = "More than one CAN channel matches this USB serial. No channel was changed."
+        return result
+    info = interfaces[0]
+    if info["ifname"] != record.get("interface"):
+        result["reason"] = "The adapter returned with a different interface name. The active backend was left running."
+        return result
+    try:
+        bridge.check_interface(info)
+        data = info.get("linkinfo", {}).get("info_data", {})
+        if info.get("mtu") != 16 or data.get("bittiming", {}).get("bitrate") != 1_000_000:
+            raise bridge.BridgeError("The interface is not configured for classic CAN at 1 Mbps.")
+    except bridge.BridgeError as exc:
+        result["reason"] = str(exc)
+        return result
+    result.update(ready=True, reason="", can_state=data.get("state", "UNKNOWN"))
+    return result
+
+
+def recover_connection(record: dict, serial: str, profile: str) -> dict:
+    """Reconnect only a replacement netdev; never restart Phoenix or reset a live bus."""
+    if not is_alive(record) or record.get("serial") != serial or record.get("profile") != profile:
+        raise bridge.BridgeError("The running bridge does not own this adapter and profile. No interface was changed.")
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            interfaces = matching_interfaces(serial)
+        except (OSError, bridge.BridgeError):
+            interfaces = []
+        if interfaces or time.monotonic() >= deadline:
+            break
+        time.sleep(0.3)
+    if len(interfaces) != 1 or interfaces[0]["ifname"] != record.get("interface"):
+        raise bridge.BridgeError("The original adapter has not returned on the same CAN interface. The backend was left running.")
+    info = interfaces[0]
+    if "UP" not in info.get("flags", []):
+        previous_index = record.get("ifindex")
+        if previous_index is None or info.get("ifindex") == previous_index:
+            raise bridge.BridgeError("The existing CAN interface is down; it will not be reconfigured automatically.")
+        # A fresh kernel index proves that USB created a replacement interface.
+        # configure_interface itself also refuses to reset an already-up link.
+        bridge.configure_interface(info["ifname"], 1_000_000)
+    connection = inspect_connection(record)
+    if not connection["ready"]:
+        raise bridge.BridgeError(connection["reason"])
+    return {**record, "ifindex": connection["interfaces"][0]["ifindex"]}
+
+
+def save_record(path: Path, record: dict, user) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(record))
+    os.chown(temporary, user.pw_uid, user.pw_gid)
+    temporary.replace(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "start", "status", "watch"])
+    parser.add_argument("action", choices=["prepare", "start", "status", "watch", "recover"])
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument("--serial", default="")
     parser.add_argument("--profile", choices=VERSIONS, default="stable")
@@ -84,7 +148,14 @@ def main() -> None:
         return
     if args.action == "status":
         print(json.dumps({"running": is_alive(record), "record": record,
-                          "interfaces": matching_interfaces(args.serial) if args.serial else []}))
+                          "connection": inspect_connection(record)}))
+        return
+    if args.action == "recover":
+        with (state / "connection.lock").open("a") as connection_lock:
+            fcntl.flock(connection_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = recover_connection(record, args.serial, args.profile)
+            save_record(record_file, record, user)
+        print(json.dumps({"running": True, "record": record, "connection": inspect_connection(record)}))
         return
     version = VERSIONS[args.profile]
     venv = home / ".local/share/usb-can-tuner/venvs" / version
@@ -149,11 +220,9 @@ def main() -> None:
             pass_fds=(lock.fileno(),), user=user.pw_uid, group=user.pw_gid, extra_groups=[],
             cwd=str(home), env={**os.environ, "HOME": str(home), "PYTHONNOUSERSITE": "1"})
     record = {"pid": child.pid, "token": process_token(child.pid), "interface": interface,
-              "serial": args.serial, "profile": args.profile, "version": version, "log": str(logfile)}
-    temp = record_file.with_suffix(".tmp")
-    temp.write_text(json.dumps(record))
-    os.chown(temp, user.pw_uid, user.pw_gid)
-    temp.replace(record_file)
+              "serial": args.serial, "profile": args.profile, "version": version, "log": str(logfile),
+              "ifindex": bridge.interface_info(interface)["ifindex"]}
+    save_record(record_file, record, user)
     lock.close()
     for _ in range(50):
         if child.poll() is not None:

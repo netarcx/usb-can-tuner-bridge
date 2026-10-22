@@ -7,7 +7,7 @@ needed. The server truthfully identifies itself as Linux x86-64.
 
 ## Run on Windows
 
-Download the Windows executable from the [v0.1.0 prototype release](https://github.com/netarcx/usb-can-tuner-bridge/releases/tag/v0.1.0).
+Download the Windows executable from the [v0.1.1 prototype release](https://github.com/netarcx/usb-can-tuner-bridge/releases/tag/v0.1.1).
 Setup instructions and checksums are included with the download.
 
 Build output: `dist/USB-CAN Tuner Bridge.exe` at the repository root.
@@ -68,8 +68,13 @@ ABIs. Unknown versions are rejected before loading libraries.
   HTTP version checks continue. Tuner manages the device traffic.
 - The app never detaches USB, force-binds drivers, resets adapters, enables CAN FD,
   feeds robot enable, writes device configuration, or starts firmware programming.
-- Once connected, loss of connectivity is reported with **no automatic restart**.
-  Do not unplug USB, shut down WSL/Windows, or remove device power during updates.
+- Connection status checks the physical CAN interface as well as HTTP. A live
+  diagnostic server with no adapter is reported as disconnected.
+- The same shared USB serial is reattached automatically after a disconnect. Only
+  a newly created, down CAN interface is configured; the Phoenix process keeps
+  running. Existing down links, bus-off, wrong adapters, and ambiguous channels
+  are left alone. No automatic diagnostic-server restart occurs.
+- Do not unplug USB, shut down WSL/Windows, or remove device power during updates.
 
 **Completed firmware programming and recovery have not been validated in this
 project.** Validation covers device discovery and self-test. This prototype cannot
@@ -80,9 +85,9 @@ For a deliberate restart or profile change, first finish updates and close Tuner
 Inspect `~/.local/state/usb-can-tuner/process.json` in WSL, verify its PID,
 `/proc/PID/cmdline`, and start-time token before sending SIGTERM. Then exit the
 launcher from its tray menu and reopen it with the required profile. There is no
-one-click stop/reset that could interrupt programming. After physically unplugging
-an active adapter, the old server can retain its old interface binding and need
-this deliberate restart. USB/IP detach/reattach is a manual recovery step only.
+one-click stop/reset that could interrupt programming. Replugging the same adapter on the same Linux interface name now restores its
+USB attachment automatically without restarting the backend. A different interface
+name, removed USB sharing, or an existing failed bus still requires attention.
 
 Windows logs and helper scripts: `%LOCALAPPDATA%\UsbCanTuner`.
 Linux log: `~/.local/state/usb-can-tuner/backend.log`.
@@ -106,12 +111,15 @@ does not replace drivers automatically.
   **167 populated values**. Robot Enable and Device Enable are Disabled.
 - Earlier alpha testing discovered the same device on firmware 26.70.0.0. The
   later change to 26.3.0.0 exposed the self-test mismatch described above.
-- Unit tests cover both ABIs, unsupported versions, runtime locks, port occupancy,
+- Twenty-one unit tests cover USB recovery identity/index guards, truthful CAN status,
+  both ABIs, unsupported versions, runtime locks, port occupancy,
   TIME_WAIT, bus preservation, bitrate failure, and disabled enable transmission.
   A duplicate live CLI start is rejected without changing the working bus.
 - Full Windows USB/IP attachment and startup from a detached adapter pass.
   Closing to tray, terminating/reopening the GUI, and duplicate GUI startup preserve
-  the same backend; self-test remains populated afterward. The executable smoke
+  the same backend; self-test remains populated afterward. Reattachment after
+  an unexpected USB/IP disconnect restores the Kraken without a backend restart.
+  The executable smoke
   test and a clean SHA-256-verified requirements installation also pass.
 - No firmware writes, configuration changes, or motor-control tests are performed
   during project validation. Clean-PC prerequisite installation, other adapters, and

@@ -120,7 +120,8 @@ internal sealed class MainForm : Form
     private readonly NotifyIcon tray;
     private string payload = "", linuxPayload = "", preparedKey = "", uid = "", lastMessage = "";
     private string currentInterface = "can0";
-    private bool busy, faulted, sessionObserved, permitExit;
+    private bool busy, faulted, sessionObserved, permitExit, keepAliveStarted;
+    private string? managedSerial;
     private int readFailures;
     private int pollCount;
     private string Profile => profile.SelectedIndex == 1 ? "alpha" : "stable";
@@ -259,6 +260,123 @@ internal sealed class MainForm : Form
         using var watcher = Process.Start(start) ?? throw new IOException("Could not hold the backend's WSL session open.");
     }
 
+    private async Task<Adapter[]> ReadAdapters()
+    {
+        if (!File.Exists(Commands.Usbipd)) throw new IOException("usbipd-win is missing. Use First-time setup, then retry.");
+        using var json = JsonDocument.Parse(await Commands.Run(Commands.Usbipd, ["state"]));
+        return json.RootElement.GetProperty("Devices").EnumerateArray().Where(d =>
+            d.GetProperty("BusId").ValueKind == JsonValueKind.String &&
+            (d.GetProperty("InstanceId").GetString() ?? "").Contains("VID_1D50&PID_606F", StringComparison.OrdinalIgnoreCase)).Select(d =>
+        {
+            var instance = d.GetProperty("InstanceId").GetString()!;
+            return new Adapter(d.GetProperty("BusId").GetString()!, instance.Split('\\')[^1],
+                d.GetProperty("Description").GetString() ?? "USB-CAN", d.GetProperty("PersistedGuid").ValueKind == JsonValueKind.String,
+                d.GetProperty("ClientIPAddress").ValueKind == JsonValueKind.String);
+        }).ToArray();
+    }
+
+    private void ShowAdapters(Adapter[] candidates)
+    {
+        var selection = managedSerial ?? (adapters.SelectedItem as Adapter)?.Serial;
+        if (!adapters.Items.Cast<Adapter>().SequenceEqual(candidates))
+        {
+            adapters.Items.Clear(); adapters.Items.AddRange(candidates);
+            if (selection != null) adapters.SelectedIndex = Array.FindIndex(candidates, a => a.Serial == selection);
+            else if (candidates.Length == 1) adapters.SelectedIndex = 0;
+        }
+        adapters.Enabled = managedSerial == null;
+    }
+
+    private async Task AttachAdapter(Adapter adapter, bool initialConnection)
+    {
+        if (!Regex.IsMatch(adapter.BusId, @"^\d+-\d+$") || !Regex.IsMatch(adapter.Serial, @"^[\w.\-]+$"))
+            throw new IOException("This adapter's USB identity cannot be mapped safely.");
+        if (!adapter.Shared)
+        {
+            if (!initialConnection) throw new IOException("USB sharing for the original adapter was removed. Re-enable sharing before retrying.");
+            Log("Requesting Administrator approval to share USB " + adapter.BusId + " once.");
+            var start = new ProcessStartInfo(Commands.Usbipd) { UseShellExecute = true, Verb = "runas", Arguments = "bind --busid " + adapter.BusId };
+            using var bind = Process.Start(start) ?? throw new IOException("USB sharing was cancelled.");
+            await bind.WaitForExitAsync();
+            if (bind.ExitCode != 0) throw new IOException("usbipd could not share this adapter. No driver replacement was forced.");
+        }
+        await Commands.Run("wsl.exe", ["--distribution", Distro, "--user", "root", "--exec", "/sbin/modprobe", "gs_usb"]);
+        if (!adapter.Attached) await Commands.Run(Commands.Usbipd, ["attach", "--wsl", Distro, "--busid", adapter.BusId]);
+    }
+
+    private async Task ManagedConnection(JsonElement snapshot, JsonElement? version)
+    {
+        var record = snapshot.GetProperty("record");
+        managedSerial = record.GetProperty("serial").GetString()!;
+        currentInterface = record.GetProperty("interface").GetString()!;
+        profile.SelectedIndex = record.GetProperty("profile").GetString() == "alpha" ? 1 : 0;
+        distro.Enabled = false; profile.Enabled = false;
+        sessionObserved = true;
+        if (!keepAliveStarted) { KeepWslSession(); keepAliveStarted = true; }
+        var candidates = await ReadAdapters();
+        ShowAdapters(candidates);
+        var adapter = candidates.SingleOrDefault(a => a.Serial.Equals(managedSerial, StringComparison.OrdinalIgnoreCase));
+        var connection = snapshot.GetProperty("connection");
+        var links = connection.GetProperty("interfaces").EnumerateArray().ToArray();
+        var ready = connection.GetProperty("ready").GetBoolean();
+        var originalIndex = record.TryGetProperty("ifindex", out var index) ? index.GetInt32() : (int?)null;
+        var replacementDown = links.Length == 1 && originalIndex.HasValue &&
+            links[0].GetProperty("ifindex").GetInt32() != originalIndex.Value &&
+            !links[0].GetProperty("flags").EnumerateArray().Any(f => f.GetString() == "UP");
+        if (!ready && !faulted && ((links.Length == 0 && adapter is { Attached: false }) || replacementDown))
+        {
+            State("Reconnecting your USB-CAN adapter…", "Restoring the original adapter connection. The diagnostic backend stays running.", Color.FromArgb(34, 94, 176));
+            devices.Text = "Waiting for CAN devices to reconnect.";
+            if (links.Length == 0) await AttachAdapter(adapter!, initialConnection: false);
+            using var recovered = JsonDocument.Parse(await Helper("recover", managedSerial));
+            connection = recovered.RootElement.GetProperty("connection").Clone();
+            ready = connection.GetProperty("ready").GetBoolean();
+            Log("Restored USB-CAN attachment without restarting Phoenix or resetting an active CAN interface.");
+        }
+        else if (ready && (originalIndex == null || links[0].GetProperty("ifindex").GetInt32() != originalIndex))
+        {
+            // Migrate a healthy v0.1.0 record, or record a link already brought up
+            // externally. recover validates identity and never resets an UP link.
+            await Helper("recover", managedSerial);
+        }
+        if (!ready)
+        {
+            State(links.Length == 0 ? "USB-CAN adapter disconnected" : "CAN connection needs attention",
+                connection.GetProperty("reason").GetString() ?? "CAN interface is unavailable.", Color.FromArgb(161, 75, 20));
+            devices.Text = "CAN devices are unavailable. The diagnostic server alone does not establish a CAN connection.";
+            return;
+        }
+        if (!version.HasValue)
+        {
+            State("Diagnostic server is not responding", "The CAN interface is present. The backend was left running; no automatic restart was attempted.", Color.FromArgb(161, 75, 20));
+            return;
+        }
+        if (connection.GetProperty("can_state").GetString() == "ERROR-PASSIVE")
+        {
+            State("CAN bus reports errors", "Check device power, wiring, and termination. The adapter will not be reset automatically.", Color.FromArgb(161, 75, 20));
+            devices.Text = "A working device connection has not been verified.";
+            return;
+        }
+        readFailures = 0;
+        var text = version.Value.GetProperty("Version").GetString() ?? "Unknown";
+        State("USB-CAN connected", $"Phoenix {text} • {currentInterface}. Open Tuner with the target below.", Color.FromArgb(22, 118, 75));
+        if (++pollCount % 2 != 0) return;
+        if (TunerIsOpen())
+        {
+            if (!devices.Text.Contains("firmware ")) devices.Text = "Phoenix Tuner is managing devices. Use its device list while it is open.";
+            return;
+        }
+        var result = await ReadDiagnostic("getdevices");
+        if (result.HasValue && result.Value.TryGetProperty("DeviceArray", out var list))
+        {
+            var rows = list.EnumerateArray().ToArray();
+            devices.Text = rows.Length == 0 ? "Waiting for CAN devices. Check power, wiring, and termination." : string.Join(Environment.NewLine,
+                rows.Select(d => $"{Field(d, "Name")}  •  ID {Field(d, "ID")}  •  {Field(d, "Model")}  •  firmware {Field(d, "CurrentVers")}"));
+            var mismatch = rows.Any(d => d.TryGetProperty("Compliancy", out var c) && c.GetInt32() != version.Value.GetProperty("Compliancy").GetInt32());
+            if (mismatch) detail.Text += " Firmware and backend generations differ; self-test may be unavailable. Do not change backends during an update.";
+        }
+    }
+
     private async Task Tick()
     {
         if (busy || IsDisposed || distro.SelectedItem == null) return;
@@ -266,55 +384,26 @@ internal sealed class MainForm : Form
         try
         {
             var version = await ReadDiagnostic("getversion");
+            using var statusDocument = JsonDocument.Parse(await Helper("status"));
+            var snapshot = statusDocument.RootElement;
+            if (snapshot.GetProperty("running").GetBoolean())
+            {
+                await ManagedConnection(snapshot, version);
+                return;
+            }
             if (version.HasValue)
             {
-                if (!sessionObserved)
-                {
-                    // Reopening the launcher follows its detached backend's bus.
-                    try
-                    {
-                        using var existing = JsonDocument.Parse(await Helper("status"));
-                        if (existing.RootElement.GetProperty("running").GetBoolean())
-                        {
-                            currentInterface = existing.RootElement.GetProperty("record").GetProperty("interface").GetString()!;
-                            KeepWslSession();
-                        }
-                    }
-                    catch (IOException) { /* An externally started server is left alone. */ }
-                }
-                sessionObserved = true; readFailures = 0;
-                profile.SelectedIndex = version.Value.GetProperty("Compliancy").GetInt32() == 21 ? 1 : 0;
-                distro.Enabled = false; profile.Enabled = false;
-                var text = version.Value.GetProperty("Version").GetString() ?? "Unknown";
-                State("Connected to Phoenix", $"Phoenix {text} • {currentInterface}. Open Tuner with the target below.", Color.FromArgb(22, 118, 75));
-                if (++pollCount % 2 == 0)
-                {
-                    // Leave device discovery and update traffic to Tuner while it
-                    // is open. getversion above only checks the local HTTP server.
-                    if (TunerIsOpen())
-                    {
-                        if (!devices.Text.Contains("firmware ")) devices.Text = "Phoenix Tuner is managing devices. Use its device list while it is open.";
-                        return;
-                    }
-                    var result = await ReadDiagnostic("getdevices");
-                    if (result.HasValue && result.Value.TryGetProperty("DeviceArray", out var list))
-                    {
-                        var rows = list.EnumerateArray().ToArray();
-                        devices.Text = rows.Length == 0 ? "Waiting for CAN devices. Check power, wiring, and termination." : string.Join(Environment.NewLine,
-                            rows.Select(d => $"{Field(d, "Name")}  •  ID {Field(d, "ID")}  •  {Field(d, "Model")}  •  firmware {Field(d, "CurrentVers")}"));
-                        var mismatch = rows.Any(d => d.TryGetProperty("Compliancy", out var c) && c.GetInt32() != version.Value.GetProperty("Compliancy").GetInt32());
-                        if (mismatch) detail.Text += " Firmware and backend generations differ; self-test may be unavailable. Do not change backends during an update.";
-                    }
-                }
+                State("External diagnostic server is available", "USB-CAN connectivity has not been verified for this server. Its active session was left unchanged.", Color.FromArgb(34, 94, 176));
                 return;
             }
             if (sessionObserved)
             {
-                if (++readFailures >= 3) State("Bridge connection interrupted", "No automatic reset or restart was attempted. Check the USB cable and backend log after Tuner has finished any update.", Color.FromArgb(161, 75, 20));
+                if (++readFailures >= 3) State("Bridge connection interrupted", "The backend stopped. No automatic restart was attempted; finish any Tuner operation before restarting it.", Color.FromArgb(161, 75, 20));
                 return;
             }
             if (faulted) return;
-            if (!File.Exists(Commands.Usbipd)) throw new IOException("usbipd-win is missing. Use First-time setup, then retry.");
+            var candidates = await ReadAdapters();
+            ShowAdapters(candidates);
             var key = Distro + ":" + Profile;
             if (preparedKey != key)
             {
@@ -323,23 +412,6 @@ internal sealed class MainForm : Form
                 Log("Preparing " + key);
                 await Helper("prepare"); preparedKey = key;
                 distro.Enabled = true; profile.Enabled = true;
-            }
-            using var json = JsonDocument.Parse(await Commands.Run(Commands.Usbipd, ["state"]));
-            var candidates = json.RootElement.GetProperty("Devices").EnumerateArray().Where(d =>
-                d.GetProperty("BusId").ValueKind == JsonValueKind.String &&
-                (d.GetProperty("InstanceId").GetString() ?? "").Contains("VID_1D50&PID_606F", StringComparison.OrdinalIgnoreCase)).Select(d =>
-            {
-                var instance = d.GetProperty("InstanceId").GetString()!;
-                return new Adapter(d.GetProperty("BusId").GetString()!, instance.Split('\\')[^1],
-                    d.GetProperty("Description").GetString() ?? "USB-CAN", d.GetProperty("PersistedGuid").ValueKind == JsonValueKind.String,
-                    d.GetProperty("ClientIPAddress").ValueKind == JsonValueKind.String);
-            }).ToArray();
-            var selection = (adapters.SelectedItem as Adapter)?.Serial;
-            if (!adapters.Items.Cast<Adapter>().SequenceEqual(candidates))
-            {
-                adapters.Items.Clear(); adapters.Items.AddRange(candidates);
-                if (candidates.Length == 1) adapters.SelectedIndex = 0;
-                else if (selection != null) adapters.SelectedIndex = Array.FindIndex(candidates, a => a.Serial == selection);
             }
             if (candidates.Length == 0)
             {
@@ -350,24 +422,12 @@ internal sealed class MainForm : Form
             {
                 State("Choose an adapter", "Several compatible USB adapters are connected. Select the one wired to your CTRE devices.", Color.FromArgb(34, 94, 176)); return;
             }
-            if (!Regex.IsMatch(adapter.BusId, @"^\d+-\d+$") || !Regex.IsMatch(adapter.Serial, @"^[\w.\-]+$")) throw new IOException("This adapter's USB identity cannot be mapped safely.");
             distro.Enabled = false; profile.Enabled = false;
             State("Connecting your USB-CAN adapter…", "Attaching USB to WSL and checking classic CAN at 1 Mbps.", Color.FromArgb(34, 94, 176));
-            if (!adapter.Shared)
-            {
-                Log("Requesting Administrator approval to share USB " + adapter.BusId + " once.");
-                var start = new ProcessStartInfo(Commands.Usbipd) { UseShellExecute = true, Verb = "runas", Arguments = "bind --busid " + adapter.BusId };
-                using var bind = Process.Start(start) ?? throw new IOException("USB sharing was cancelled.");
-                await bind.WaitForExitAsync();
-                if (bind.ExitCode != 0) throw new IOException("usbipd could not share this adapter. No driver replacement was forced. Check First-time setup.");
-            }
-            // Load the driver before attaching. Never detach, reset, or force-bind.
-            await Commands.Run("wsl.exe", ["--distribution", Distro, "--user", "root", "--exec", "/sbin/modprobe", "gs_usb"]);
-            if (!adapter.Attached) await Commands.Run(Commands.Usbipd, ["attach", "--wsl", Distro, "--busid", adapter.BusId]);
-            var started = await Helper("start", adapter.Serial);
-            using var record = JsonDocument.Parse(started);
-            currentInterface = record.RootElement.GetProperty("record").GetProperty("interface").GetString()!;
-            KeepWslSession();
+            await AttachAdapter(adapter, initialConnection: true);
+            using var started = JsonDocument.Parse(await Helper("start", adapter.Serial));
+            currentInterface = started.RootElement.GetProperty("record").GetProperty("interface").GetString()!;
+            KeepWslSession(); keepAliveStarted = true;
             sessionObserved = true;
             Log("Backend started on " + currentInterface + ". Closing this launcher leaves it running.");
         }
