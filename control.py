@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Windows launcher's WSL helper. No stop, reset, control, or flash operation."""
+"""Windows launcher's WSL helper. No reset, control, or flash operation.
+
+"stop" exists only for an explicit user Quit; nothing stops a backend automatically.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import signal
 import subprocess
 import sys
 import time
@@ -103,6 +107,24 @@ def recover_connection(record: dict, serial: str, profile: str) -> dict:
     return {**record, "ifindex": connection["interfaces"][0]["ifindex"]}
 
 
+def stop_backend(record: dict, grace_seconds: float = 10.0) -> bool:
+    """SIGTERM this exact backend (pid + start token), SIGKILL only after a grace period."""
+    if not is_alive(record):
+        return False
+    pid = int(record["pid"])
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while is_alive(record) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if is_alive(record):
+        os.kill(pid, signal.SIGKILL)
+        for _ in range(25):
+            if not is_alive(record):
+                break
+            time.sleep(0.2)
+    return True
+
+
 def save_record(path: Path, record: dict, user) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(record))
@@ -112,7 +134,7 @@ def save_record(path: Path, record: dict, user) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "start", "status", "watch", "recover"])
+    parser.add_argument("action", choices=["prepare", "start", "status", "watch", "recover", "stop"])
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument("--serial", default="")
     parser.add_argument("--profile", choices=VERSIONS, default="stable")
@@ -149,6 +171,10 @@ def main() -> None:
     if args.action == "status":
         print(json.dumps({"running": is_alive(record), "record": record,
                           "connection": inspect_connection(record)}))
+        return
+    if args.action == "stop":
+        stopped = stop_backend(record)
+        print(json.dumps({"stopped": stopped, "running": is_alive(record)}))
         return
     if args.action == "recover":
         with (state / "connection.lock").open("a") as connection_lock:

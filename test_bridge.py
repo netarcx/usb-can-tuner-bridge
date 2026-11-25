@@ -95,6 +95,28 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(control.inspect_connection(self.record)["ready"])
 
 
+class StopTests(unittest.TestCase):
+    record = {"pid": 4321, "token": "t"}
+
+    def test_stop_is_noop_when_backend_not_running(self):
+        with patch.object(control, "is_alive", return_value=False), patch.object(control.os, "kill") as kill:
+            self.assertFalse(control.stop_backend(self.record))
+        kill.assert_not_called()
+
+    def test_stop_sends_sigterm_and_waits(self):
+        with patch.object(control, "is_alive", side_effect=[True, False, False]), \
+             patch.object(control.os, "kill") as kill, patch.object(control.time, "sleep"):
+            self.assertTrue(control.stop_backend(self.record))
+        kill.assert_called_once_with(4321, control.signal.SIGTERM)
+
+    def test_stop_escalates_to_sigkill_after_grace(self):
+        with patch.object(control, "is_alive", side_effect=[True] + [True] * 3 + [False]), \
+             patch.object(control.os, "kill") as kill, patch.object(control.time, "sleep"):
+            self.assertTrue(control.stop_backend(self.record, grace_seconds=0))
+        self.assertEqual([c.args for c in kill.call_args_list],
+                         [(4321, control.signal.SIGTERM), (4321, control.signal.SIGKILL)])
+
+
 class BridgeTests(unittest.TestCase):
     def test_second_runtime_is_rejected_before_any_bus_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

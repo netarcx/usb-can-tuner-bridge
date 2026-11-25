@@ -96,6 +96,24 @@ internal static class Commands
     }
 
     internal static string Usbipd => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "usbipd-win", "usbipd.exe");
+
+    /// <summary>Windows processes listening on a TCP port (IPv4 or IPv6), from netstat -ano.</summary>
+    internal static async Task<(int Pid, string Name)[]> PortListeners(int port)
+    {
+        var output = await Run("netstat.exe", ["-ano", "-p", "TCP"], 10) + "\n" + await Run("netstat.exe", ["-ano", "-p", "TCPv6"], 10);
+        var pids = new HashSet<int>();
+        foreach (var line in output.Split('\n'))
+        {
+            var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 5 && parts[3] == "LISTENING" && parts[1].EndsWith(":" + port) && int.TryParse(parts[4], out var pid) && pid > 0)
+                pids.Add(pid);
+        }
+        return pids.Select(pid =>
+        {
+            try { using var p = Process.GetProcessById(pid); return (pid, p.ProcessName); }
+            catch (ArgumentException) { return (pid, "exited"); }
+        }).ToArray();
+    }
 }
 
 internal sealed record Adapter(string BusId, string Serial, string Description, bool Shared, bool Attached)
@@ -124,6 +142,13 @@ internal sealed class MainForm : Form
     private string? managedSerial;
     private int readFailures;
     private int pollCount;
+    private int tunerServerStops;
+    // Remembered between polls so the heading text does not flicker on ticks that skip getdevices.
+    private string firmwareWarning = "";
+    // Phoenix Tuner X starts this when its "CANivore USB" toggle is ON. It binds
+    // 0.0.0.0:1250, which hides the bridge and makes the launcher idle.
+    private const string TunerCanivoreServer = "Phoenix-diagnostics-application-canivore";
+    private readonly Button quit = new() { Text = "Quit and stop bridge", AutoSize = true, ForeColor = Color.FromArgb(161, 40, 20) };
     private string Profile => profile.SelectedIndex == 1 ? "alpha" : "stable";
     private string Distro => distro.SelectedItem?.ToString() ?? "Ubuntu";
 
@@ -155,20 +180,23 @@ internal sealed class MainForm : Form
         buttons.Controls.Add(tuner); buttons.Controls.Add(retry);
         var copy = new Button { Text = "Copy target", AutoSize = true }; copy.Click += (_, _) => Clipboard.SetText("localhost"); buttons.Controls.Add(copy);
         var folder = new Button { Text = "Open logs", AutoSize = true }; folder.Click += (_, _) => Process.Start(new ProcessStartInfo("explorer.exe", Program.DataDirectory) { UseShellExecute = true }); buttons.Controls.Add(folder);
+        buttons.Controls.Add(quit);
         layout.Controls.Add(buttons);
-        layout.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(780, 0), Text = "The bridge stays running when this window closes. It never starts a firmware update, feeds robot enable, or automatically resets an active adapter.", ForeColor = Color.DimGray, Margin = new Padding(0, 0, 0, 12) });
+        layout.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(780, 0), Text = "The bridge stays running when this window closes; use Quit and stop bridge to shut it down. It never starts a firmware update, feeds robot enable, or automatically resets an active adapter.", ForeColor = Color.DimGray, Margin = new Padding(0, 0, 0, 12) });
         layout.Controls.Add(new Label { AutoSize = true, Text = "Connection log", Margin = new Padding(0, 0, 0, 5) });
         layout.Controls.Add(log);
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show bridge", null, (_, _) => RestoreWindow());
         menu.Items.Add("Exit launcher (leave bridge running)", null, (_, _) => { permitExit = true; Close(); });
+        menu.Items.Add("Quit and stop bridge", null, async (_, _) => await QuitAndStop());
         tray = new NotifyIcon { Text = "USB-CAN Tuner Bridge", Icon = SystemIcons.Application, Visible = true, ContextMenuStrip = menu };
         tray.DoubleClick += (_, _) => RestoreWindow();
         FormClosing += (_, e) => { if (!permitExit && e.CloseReason is CloseReason.UserClosing or CloseReason.TaskManagerClosing) { e.Cancel = true; Hide(); tray.ShowBalloonTip(3000, "USB-CAN bridge stays connected", "Double-click this tray icon to reopen. Closing the launcher does not stop the backend.", ToolTipIcon.Info); } };
         FormClosed += (_, _) => { timer.Stop(); tray.Dispose(); http.Dispose(); };
-        retry.Click += async (_, _) => { if (busy) return; faulted = false; readFailures = 0; preparedKey = ""; await Tick(); };
+        retry.Click += async (_, _) => { if (busy) return; faulted = false; readFailures = 0; preparedKey = ""; tunerServerStops = 0; await Tick(); };
         setup.Click += (_, _) => LaunchSetup();
         tuner.Click += async (_, _) => await OpenTuner();
+        quit.Click += async (_, _) => await QuitAndStop();
         distro.SelectedIndexChanged += (_, _) => { linuxPayload = ""; preparedKey = ""; };
         profile.SelectedIndexChanged += (_, _) => { preparedKey = ""; };
         timer.Tick += async (_, _) => await Tick();
@@ -177,11 +205,6 @@ internal sealed class MainForm : Form
             try
             {
                 payload = Payload.Extract();
-                var names = await Commands.Run("wsl.exe", ["--list", "--quiet"], 15);
-                foreach (var name in names.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Select(n => n.Trim()))
-                    if (Regex.IsMatch(name, @"^[\w.\-]+$")) distro.Items.Add(name);
-                if (distro.Items.Count == 0) throw new IOException("Install WSL2 and Ubuntu with First-time setup, then launch Ubuntu once to create your Linux user.");
-                distro.SelectedIndex = Math.Max(0, distro.Items.IndexOf("Ubuntu"));
                 Log("Launcher started. Firmware programming remains entirely in Phoenix Tuner.");
                 timer.Start(); await Tick();
             }
@@ -190,6 +213,16 @@ internal sealed class MainForm : Form
     }
 
     private void RestoreWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
+    private async Task DiscoverDistributions()
+    {
+        var names = await Commands.Run("wsl.exe", ["--list", "--quiet"], 15);
+        distro.Items.Clear();
+        foreach (var name in names.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Select(n => n.Trim()))
+            if (Regex.IsMatch(name, @"^[\w.\-]+$")) distro.Items.Add(name);
+        if (distro.Items.Count == 0) throw new IOException("Install WSL2 and Ubuntu with First-time setup, then launch Ubuntu once to create your Linux user.");
+        distro.SelectedIndex = Math.Max(0, distro.Items.IndexOf("Ubuntu"));
+    }
+
     private void Log(string text)
     {
         if (lastMessage == text) return;
@@ -199,7 +232,12 @@ internal sealed class MainForm : Form
         try { File.AppendAllText(Path.Combine(Program.DataDirectory, "launcher.log"), line); } catch (IOException) { }
     }
     private void State(string heading, string message, Color color)
-    { status.Text = heading; status.ForeColor = color; detail.Text = message; }
+    {
+        // Assign only on change: re-setting identical text still relayouts AutoSize labels.
+        if (status.Text != heading) status.Text = heading;
+        if (status.ForeColor != color) status.ForeColor = color;
+        if (detail.Text != message) detail.Text = message;
+    }
     private void Fail(Exception ex)
     {
         faulted = true;
@@ -359,7 +397,7 @@ internal sealed class MainForm : Form
         }
         readFailures = 0;
         var text = version.Value.GetProperty("Version").GetString() ?? "Unknown";
-        State("USB-CAN connected", $"Phoenix {text} • {currentInterface}. Open Tuner with the target below.", Color.FromArgb(22, 118, 75));
+        State("USB-CAN connected", $"Phoenix {text} • {currentInterface}. Open Tuner with the target below.{firmwareWarning}", Color.FromArgb(22, 118, 75));
         if (++pollCount % 2 != 0) return;
         if (TunerIsOpen())
         {
@@ -373,16 +411,24 @@ internal sealed class MainForm : Form
             devices.Text = rows.Length == 0 ? "Waiting for CAN devices. Check power, wiring, and termination." : string.Join(Environment.NewLine,
                 rows.Select(d => $"{Field(d, "Name")}  •  ID {Field(d, "ID")}  •  {Field(d, "Model")}  •  firmware {Field(d, "CurrentVers")}"));
             var mismatch = rows.Any(d => d.TryGetProperty("Compliancy", out var c) && c.GetInt32() != version.Value.GetProperty("Compliancy").GetInt32());
-            if (mismatch) detail.Text += " Firmware and backend generations differ; self-test may be unavailable. Do not change backends during an update.";
+            firmwareWarning = mismatch ? " Firmware and backend generations differ; self-test may be unavailable. Do not change backends during an update." : "";
+            State("USB-CAN connected", $"Phoenix {text} • {currentInterface}. Open Tuner with the target below.{firmwareWarning}", Color.FromArgb(22, 118, 75));
         }
     }
 
     private async Task Tick()
     {
-        if (busy || IsDisposed || distro.SelectedItem == null) return;
+        if (busy || IsDisposed) return;
         busy = true; retry.Enabled = false;
         try
         {
+            if (distro.SelectedItem == null)
+            {
+                if (faulted) return;
+                // Retry must discover WSL again after First-time setup installs it.
+                await DiscoverDistributions();
+            }
+            if (await TunerServerBlocksPort()) return;
             var version = await ReadDiagnostic("getversion");
             using var statusDocument = JsonDocument.Parse(await Helper("status"));
             var snapshot = statusDocument.RootElement;
@@ -393,7 +439,8 @@ internal sealed class MainForm : Form
             }
             if (version.HasValue)
             {
-                State("External diagnostic server is available", "USB-CAN connectivity has not been verified for this server. Its active session was left unchanged.", Color.FromArgb(34, 94, 176));
+                var owners = string.Join(", ", (await Commands.PortListeners(1250)).Select(o => $"{o.Name} (PID {o.Pid})"));
+                State("Port 1250 is used by another program", $"Owner: {(owners.Length > 0 ? owners : "unknown")}. The bridge cannot start until it closes. Its session was left unchanged.", Color.FromArgb(161, 75, 20));
                 return;
             }
             if (sessionObserved)
@@ -447,6 +494,94 @@ internal sealed class MainForm : Form
                 Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(payload, "setup.ps1") + "\" -Distro " + Distro });
         }
         catch (Exception ex) { Fail(ex); }
+    }
+
+    /// <summary>
+    /// Stops Tuner's CANivore USB server when it holds port 1250 and a USB-CAN
+    /// adapter is plugged in. Leaves it alone when a real CANivore is connected.
+    /// Returns true when the port stays blocked and this tick should stop.
+    /// </summary>
+    private async Task<bool> TunerServerBlocksPort()
+    {
+        var servers = (await Commands.PortListeners(1250))
+            .Where(o => o.Name.Equals(TunerCanivoreServer, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (servers.Length == 0) return false;
+        bool adapterPresent = false, canivorePresent = false;
+        if (File.Exists(Commands.Usbipd))
+        {
+            using var json = JsonDocument.Parse(await Commands.Run(Commands.Usbipd, ["state"]));
+            foreach (var d in json.RootElement.GetProperty("Devices").EnumerateArray())
+            {
+                if (d.GetProperty("BusId").ValueKind != JsonValueKind.String) continue;
+                var instance = d.GetProperty("InstanceId").GetString() ?? "";
+                adapterPresent |= instance.Contains("VID_1D50&PID_606F", StringComparison.OrdinalIgnoreCase);
+                canivorePresent |= instance.Contains("VID_29CA&", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        if (!adapterPresent) return false;
+        if (canivorePresent)
+        {
+            State("Port 1250 is used by Tuner's CANivore server",
+                "A CANivore is plugged in, so the bridge left Tuner's server alone. Unplug the CANivore or turn CANivore USB OFF in Tuner, then click Retry connection.",
+                Color.FromArgb(161, 75, 20));
+            return true;
+        }
+        if (tunerServerStops >= 10)
+        {
+            // Tuner keeps respawning it: stop fighting and tell the user what to change.
+            State("Phoenix Tuner keeps taking port 1250",
+                "Tuner's CANivore USB setting is ON. Open Tuner's connection settings, turn CANivore USB OFF, then click Retry connection.",
+                Color.FromArgb(161, 75, 20));
+            return true;
+        }
+        foreach (var server in servers)
+        {
+            try
+            {
+                using var p = Process.GetProcessById(server.Pid);
+                p.Kill();
+                using var wait = new CancellationTokenSource(5000);
+                await p.WaitForExitAsync(wait.Token);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or OperationCanceledException or System.ComponentModel.Win32Exception)
+            {
+                State("Port 1250 is used by Tuner's CANivore server", $"Could not stop {server.Name} (PID {server.Pid}): {ex.Message}. Turn CANivore USB OFF in Tuner.", Color.FromArgb(161, 75, 20));
+                return true;
+            }
+        }
+        tunerServerStops++;
+        Log(tunerServerStops < 3
+            ? "Stopped Phoenix Tuner's CANivore USB server; it was holding port 1250. Turn CANivore USB OFF in Tuner to keep it from coming back."
+            : $"Tuner restarted its CANivore USB server again ({tunerServerStops}x). Turn CANivore USB OFF in Tuner's connection settings.");
+        await Task.Delay(500);
+        return false;
+    }
+
+    private async Task QuitAndStop()
+    {
+        if (MessageBox.Show("Stop the Phoenix backend, give the USB-CAN adapter back to Windows, and close this app?\n\nDo NOT do this while Tuner is updating firmware.",
+                Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+        timer.Stop();
+        for (var i = 0; busy && i < 600; i++) await Task.Delay(100);
+        busy = true; quit.Enabled = false; retry.Enabled = false;
+        State("Stopping the bridge…", "Stopping the Phoenix backend and releasing the USB-CAN adapter.", Color.FromArgb(34, 94, 176));
+        try
+        {
+            using var result = JsonDocument.Parse(await Helper("stop"));
+            Log(result.RootElement.GetProperty("stopped").GetBoolean() ? "Backend stopped." : "No backend was running.");
+        }
+        catch (Exception ex) { Log("Backend stop: " + ex.Message); }
+        try
+        {
+            foreach (var adapter in (await ReadAdapters()).Where(a => a.Attached && (managedSerial == null || a.Serial.Equals(managedSerial, StringComparison.OrdinalIgnoreCase))))
+            {
+                await Commands.Run(Commands.Usbipd, ["detach", "--busid", adapter.BusId]);
+                Log("Released USB " + adapter.BusId + " back to Windows.");
+            }
+        }
+        catch (Exception ex) { Log("USB release: " + ex.Message); }
+        permitExit = true;
+        Close();
     }
 
     private async Task OpenTuner()
